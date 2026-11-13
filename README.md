@@ -77,14 +77,11 @@
 
 ```bash
 # Cloner le dépôt
-git clone https://github.com/TON_USERNAME/phishing-threat-detector.git
-cd phishing-threat-detector
+git clone https://github.com/Jimo0x/Phishing-Page-Detector.git
+cd Phishing-Page-Detector
 
 # Installer les dépendances Python
-pip install requests beautifulsoup4 python-whois tldextract exifread pillow olefile numpy
-
-# Dépendance système
-sudo apt install libmagic1 -y
+pip install -r requirements.txt
 ```
 
 ---
@@ -92,8 +89,26 @@ sudo apt install libmagic1 -y
 ## ▶️ Utilisation
 
 ```bash
-python3 phishing_detector.py
+python3 phishing_detector.py            # menu interactif
 ```
+
+### En ligne de commande (scripts, CI, analyse en lot)
+
+```bash
+python3 phishing_detector.py --url https://exemple-suspect.tk/login
+python3 phishing_detector.py --file facture.pdf.exe -o rapport_facture.html
+python3 phishing_detector.py --image photo.jpg --no-report
+python3 phishing_detector.py --url exemple.com --json > resultat.json
+```
+
+| Option | Rôle |
+|---|---|
+| `-u/--url`, `-f/--file`, `-i/--image` | cible à analyser |
+| `-o/--output` | chemin du rapport HTML |
+| `--no-report` | pas de rapport HTML |
+| `--json` | résultat JSON sur stdout (les logs passent sur stderr) |
+
+**Codes de sortie** : `0` = sûr ou à surveiller, `1` = suspect, `2` = dangereux.
 
 ### Menu principal
 
@@ -172,6 +187,8 @@ python3 phishing_detector.py
 phishing-threat-detector/
 │
 ├── phishing_detector.py    # Script principal
+├── requirements.txt        # Dépendances
+├── tests/                  # Tests (pytest)
 └── README.md               # Documentation
 ```
 
@@ -193,6 +210,18 @@ rapport_20240125_160842.html    ← ouvrir dans le navigateur
 | 70 — 100 | 🔴 Dangereux / Phishing très probable |
 
 Chaque vérification contribue au score total (plafonné à 100). Plus le score est élevé, plus la cible présente de signaux d'alerte.
+
+---
+
+## 🧪 Tests
+
+```bash
+pip install pytest && pytest -q
+```
+
+Les tests couvrent la détection d'usurpation de marque (sans faux positifs sur
+`freedom.org` ou le vrai `paypal.com`), l'analyse de fichiers, l'échappement du
+rapport HTML et la ligne de commande. Ils tournent automatiquement sur GitHub Actions.
 
 ---
 
