@@ -3,10 +3,12 @@
 import re
 import os
 import sys
+import html
+import argparse
+import contextlib
 import math
 import json
 import struct
-import string
 import socket
 import ssl
 import requests
@@ -103,6 +105,28 @@ STRINGS_SUSPECTS = [
 # ═══════════════════════════════════════════
 #   MODULE 1 — ANALYSE URL
 # ═══════════════════════════════════════════
+def marques_usurpees(url):
+    """Marques citées dans l'URL alors que le domaine n'appartient pas à la marque.
+
+    On compare des mots entiers (« free » ne matche plus « freedom », « ups » ne
+    matche plus « groups ») et on ignore le site officiel (paypal.com n'usurpe pas PayPal).
+    Les marques de 5 lettres ou plus sont aussi cherchées collées dans le domaine
+    (paypalsecure.com).
+    """
+    parsed = urlparse(url)
+    ext = tldextract.extract(url)
+    domaine = ext.domain.lower()
+    hote = parsed.netloc.lower().rsplit("@", 1)[-1].split(":")[0]
+    jetons = set(re.split(r"[^a-z0-9]+", f"{hote} {parsed.path.lower()}")) - {""}
+    trouvees = []
+    for m in MARQUES_CIBLES:
+        if domaine == m:
+            continue
+        if m in jetons or (len(m) >= 5 and m in domaine):
+            trouvees.append(m)
+    return trouvees
+
+
 def analyser_url(url):
     resultats = {}
     score = 0
@@ -143,7 +167,7 @@ def analyser_url(url):
         score += 15
         warn(f"TLD suspect ({tld}) → +15 pts")
 
-    marques = [m for m in MARQUES_CIBLES if m in url.lower()]
+    marques = marques_usurpees(url)
     resultats["marques_trouvees"] = marques
     if marques:
         score += 20
@@ -368,17 +392,9 @@ def extraire_strings(chemin, min_len=6):
     try:
         with open(chemin, "rb") as f:
             data = f.read()
-        result = []
-        current = ""
-        for byte in data:
-            char = chr(byte)
-            if char in string.printable and char not in "\n\r\t":
-                current += char
-            else:
-                if len(current) >= min_len:
-                    result.append(current)
-                current = ""
-        return result
+        # Regex : bien plus rapide que la boucle octet par octet, et récupère
+        # aussi la dernière chaîne quand le fichier se termine par du texte.
+        return [m.decode("ascii") for m in re.findall(rb"[\x20-\x7e]{%d,}" % min_len, data)]
     except Exception:
         return []
 
@@ -692,22 +708,26 @@ def generer_rapport(cible, score, verdict_txt, couleur, details, fichier="rappor
             return ""
         lignes = ""
         for k, v in data.items():
+            # Tout ce qui vient de la cible (titre de page, strings d'un fichier, EXIF...)
+            # est contrôlé par l'attaquant : on l'échappe pour éviter un XSS dans le rapport.
             if isinstance(v, list):
-                v = "<br>".join(str(x) for x in v) if v else "Aucun"
-            lignes += f"<tr><td>{k}</td><td>{v}</td></tr>"
+                v = "<br>".join(html.escape(str(x)) for x in v) if v else "Aucun"
+            else:
+                v = html.escape(str(v))
+            lignes += f"<tr><td>{html.escape(str(k))}</td><td>{v}</td></tr>"
         return f"""
         <div class="section">
-          <h3>{titre}</h3>
+          <h3>{html.escape(titre)}</h3>
           <table><tbody>{lignes}</tbody></table>
         </div>"""
 
     sections_html = "".join(section(n, d) for n, d in details.items() if d)
 
-    html = f"""<!DOCTYPE html>
+    page = f"""<!DOCTYPE html>
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
-<title>Rapport — {cible[:50]}</title>
+<title>Rapport — {html.escape(cible[:50])}</title>
 <style>
   body {{ font-family:'Segoe UI',sans-serif; background:#0d1117; color:#c9d1d9; margin:0; padding:20px; }}
   h1 {{ color:#58a6ff; border-bottom:1px solid #30363d; padding-bottom:10px; }}
@@ -727,7 +747,7 @@ def generer_rapport(cible, score, verdict_txt, couleur, details, fichier="rappor
 </head>
 <body>
 <h1>🔍 Phishing & Threat Detector — Rapport</h1>
-<p>Cible analysée : <code>{cible}</code></p>
+<p>Cible analysée : <code>{html.escape(cible)}</code></p>
 <p>Date : <strong>{date_scan}</strong></p>
 <div class="verdict">
   <div class="score">{score}/100</div>
@@ -739,17 +759,36 @@ def generer_rapport(cible, score, verdict_txt, couleur, details, fichier="rappor
 </html>"""
 
     with open(fichier, "w", encoding="utf-8") as f:
-        f.write(html)
+        f.write(page)
     succes(f"Rapport sauvegardé : {fichier}")
 
 
 # ═══════════════════════════════════════════
-#   MENU PRINCIPAL
+#   ANALYSE + MENU / LIGNE DE COMMANDE
 # ═══════════════════════════════════════════
-def main():
+def analyser(mode, cible):
+    """Lance l'analyse adaptée. mode = 'url' | 'fichier' | 'image'."""
+    details = {}
+    if mode == "url":
+        if not cible.startswith(("http://", "https://")):
+            cible = "https://" + cible
+        score = 0
+        s, r = analyser_url(cible);           score += s; details["🔗 Analyse URL"] = r
+        s, r = verifier_ssl(cible);           score += s; details["🔒 SSL"] = r
+        s, r, page = analyser_headers(cible); score += s; details["📡 Headers HTTP"] = r
+        s, r = analyser_contenu(page, cible); score += s; details["📄 Contenu HTML"] = r
+        s, r = analyser_whois(cible);         score += s; details["🌍 WHOIS"] = r
+    elif mode == "fichier":
+        score, details["📁 Analyse Fichier"] = analyser_fichier(cible)
+    else:
+        score, details["🖼️ Analyse Image"] = analyser_image(cible)
+    return cible, score, details
+
+
+def menu_interactif():
     print(f"""{C.CYAN}{C.GRAS}
   ╔══════════════════════════════════════════╗
-  ║   Phishing & Threat Detector  v2.0       ║
+  ║   Phishing & Threat Detector  v2.1       ║
   ║                                          ║
   ╚══════════════════════════════════════════╝
 {C.RESET}""")
@@ -757,55 +796,63 @@ def main():
     print("  2. Analyser un fichier suspect")
     print("  3. Analyser une image suspecte")
     print("  4. Quitter")
-
     choix = input(f"\n{C.GRAS}>> Choix : {C.RESET}").strip()
-    score_total = 0
-    details = {}
-    cible = ""
-
     if choix == "1":
-        cible = input(">> URL à analyser : ").strip()
-        if not cible.startswith("http"):
-            cible = "https://" + cible
-        print()
-
-        s, r = analyser_url(cible);          score_total += s; details["🔗 Analyse URL"] = r
-        s, r = verifier_ssl(cible);          score_total += s; details["🔒 SSL"] = r
-        s, r, html = analyser_headers(cible); score_total += s; details["📡 Headers HTTP"] = r
-        s, r = analyser_contenu(html, cible); score_total += s; details["📄 Contenu HTML"] = r
-        s, r = analyser_whois(cible);        score_total += s; details["🌍 WHOIS"] = r
-
-    elif choix == "2":
-        cible = input(">> Chemin du fichier : ").strip()
-        print()
-        score_total, details_f = analyser_fichier(cible)
-        details["📁 Analyse Fichier"] = details_f
-
-    elif choix == "3":
-        cible = input(">> Chemin de l'image : ").strip()
-        print()
-        score_total, details_i = analyser_image(cible)
-        details["🖼️ Analyse Image"] = details_i
-
-    elif choix == "4":
-        print("Bye!")
-        return
-    else:
+        return "url", input(">> URL à analyser : ").strip()
+    if choix == "2":
+        return "fichier", input(">> Chemin du fichier : ").strip()
+    if choix == "3":
+        return "image", input(">> Chemin de l'image : ").strip()
+    if choix != "4":
         erreur("Choix invalide.")
-        return
+    return None, None
 
-    # Verdict
-    score_final, verdict_txt, couleur = verdict(score_total)
-    print(f"\n{'═'*52}")
-    print(f"{C.GRAS}  VERDICT FINAL{C.RESET}")
-    print(f"  Score  : {score_final}/100")
-    print(f"  Résultat : {verdict_txt}")
-    print(f"{'═'*52}\n")
 
-    # Rapport
-    nom = f"rapport_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
-    generer_rapport(cible, score_final, verdict_txt, couleur, details, nom)
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Phishing & Threat Detector — score de risque d'une URL, d'un fichier ou d'une image.",
+        epilog="Sans argument, le menu interactif s'ouvre. Codes de sortie : 0 = sûr/à surveiller, 1 = suspect, 2 = dangereux.",
+    )
+    cible_grp = parser.add_mutually_exclusive_group()
+    cible_grp.add_argument("-u", "--url", help="URL à analyser")
+    cible_grp.add_argument("-f", "--file", help="fichier suspect à analyser")
+    cible_grp.add_argument("-i", "--image", help="image suspecte à analyser")
+    parser.add_argument("-o", "--output", help="chemin du rapport HTML (défaut : rapport_<date>.html)")
+    parser.add_argument("--no-report", action="store_true", help="ne pas générer de rapport HTML")
+    parser.add_argument("--json", action="store_true", help="résultat en JSON sur la sortie standard")
+    args = parser.parse_args(argv)
+
+    if args.url:
+        mode, cible = "url", args.url
+    elif args.file:
+        mode, cible = "fichier", args.file
+    elif args.image:
+        mode, cible = "image", args.image
+    else:
+        mode, cible = menu_interactif()
+        if not mode:
+            return 0
+    print()
+
+    # En mode JSON, les logs colorés partent sur stderr pour garder un JSON propre.
+    logs = sys.stderr if args.json else sys.stdout
+    with contextlib.redirect_stdout(logs):
+        cible, score_total, details = analyser(mode, cible)
+        score_final, verdict_txt, couleur = verdict(score_total)
+        print(f"\n{'═'*52}")
+        print(f"{C.GRAS}  VERDICT FINAL{C.RESET}")
+        print(f"  Score  : {score_final}/100")
+        print(f"  Résultat : {verdict_txt}")
+        print(f"{'═'*52}\n")
+        if not args.no_report:
+            nom = args.output or f"rapport_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+            generer_rapport(cible, score_final, verdict_txt, couleur, details, nom)
+
+    if args.json:
+        print(json.dumps({"cible": cible, "score": score_final, "verdict": verdict_txt,
+                          "details": details}, ensure_ascii=False, indent=2, default=str))
+    return 2 if score_final >= 70 else 1 if score_final >= 45 else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
